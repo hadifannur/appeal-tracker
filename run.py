@@ -138,7 +138,7 @@ def map_tasks_to_base(released_tasks, base_records):
         name = extract_text(rec["fields"].get("Task Name", ""))
         base_lookup.setdefault(name, []).append(rec)
 
-    print(f"\n{'Task Name':<55} {'Appeal Initiator':<45} {'Query':<45} {'Arbitrator Decision'}")
+    print(f"\n{'Task Name':<55} {'Appeal Initiator Email':<45} {'Query':<45} {'Arbitrator Decision'}")
     print("-" * 170)
 
     for task_name in released_tasks:
@@ -147,7 +147,8 @@ def map_tasks_to_base(released_tasks, base_records):
                 initiator_raw = rec["fields"].get("Appeal Initiator")
                 if isinstance(initiator_raw, list):
                     initiator = ", ".join(
-                        p.get("name") or p.get("en_name", "") for p in initiator_raw
+                        p.get("email") or p.get("name") or p.get("en_name", "")
+                        for p in initiator_raw
                     )
                 else:
                     initiator = extract_text(initiator_raw)
