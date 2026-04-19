@@ -1,4 +1,6 @@
 import os
+from urllib.parse import parse_qs, quote, urlparse
+
 import requests
 from dotenv import load_dotenv
 
@@ -15,6 +17,7 @@ BASE_TABLE_ID = os.getenv("BASE_TABLE_ID")
 BASE_VIEW_ID = os.getenv("BASE_VIEW_ID")
 
 BASE_URL = "https://open.larkoffice.com"
+DECISIONS_TO_UPDATE = {"Edge Case", "Successful Appeal"}
 
 
 def get_tenant_access_token():
@@ -28,39 +31,194 @@ def get_tenant_access_token():
     return data["tenant_access_token"]
 
 
-def get_sheet_data(token):
-    # Read all data from the sheet (up to row 1000)
-    range_str = f"{SHEET_ID}!A1:Z1000"
-    url = f"{BASE_URL}/open-apis/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{range_str}"
+def api_get(url, token, params=None):
     headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers)
+    resp = requests.get(url, headers=headers, params=params)
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != 0:
-        raise RuntimeError(f"Failed to read sheet: {data}")
-    return data["data"]["valueRange"]["values"]
+        raise RuntimeError(f"GET failed: {url} -> {data}")
+    return data
+
+
+def api_post(url, token, payload):
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    resp = requests.post(url, headers=headers, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"POST failed: {url} -> {data}")
+    return data
+
+
+def api_put(url, token, payload):
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    resp = requests.put(url, headers=headers, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"PUT failed: {url} -> {data}")
+    return data
+
+
+def normalize_text(value):
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def find_column_index(headers, *candidates):
+    normalized_headers = [normalize_text(header) for header in headers]
+    for candidate in candidates:
+        normalized_candidate = normalize_text(candidate)
+        if normalized_candidate in normalized_headers:
+            return normalized_headers.index(normalized_candidate)
+    raise RuntimeError(f"Could not find required column. Headers found: {headers}")
+
+
+def column_letter(index):
+    result = ""
+    current = index + 1
+    while current > 0:
+        current, remainder = divmod(current - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def parse_sheet_resource(url):
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    query = parse_qs(parsed.query)
+    sheet_id = (query.get("sheet") or [None])[0]
+
+    if len(parts) >= 2 and parts[0] == "wiki":
+        return {"type": "wiki", "token": parts[1], "sheet_id": sheet_id}
+    if len(parts) >= 2 and parts[0] == "sheets":
+        return {"type": "sheet", "token": parts[1], "sheet_id": sheet_id}
+
+    raise RuntimeError(f"Unsupported sheet URL: {url}")
+
+
+def resolve_spreadsheet_token(token, resource):
+    if resource["type"] == "sheet":
+        return resource["token"]
+
+    url = f"{BASE_URL}/open-apis/wiki/v2/spaces/get_node"
+    data = api_get(url, token, params={"token": resource["token"]})
+    return data["data"]["node"]["obj_token"]
+
+
+def get_tracker_spreadsheet_token(token):
+    resource = {"type": "wiki", "token": SPREADSHEET_TOKEN, "sheet_id": SHEET_ID}
+    try:
+        return resolve_spreadsheet_token(token, resource)
+    except RuntimeError:
+        return SPREADSHEET_TOKEN
+
+
+def get_sheet_metadata(token, spreadsheet_token):
+    url = f"{BASE_URL}/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/metainfo"
+    data = api_get(url, token)
+    return data["data"]
+
+
+def resolve_sheet_target(token, url):
+    resource = parse_sheet_resource(url)
+    spreadsheet_token = resolve_spreadsheet_token(token, resource)
+    sheet_id = resource["sheet_id"]
+
+    if not sheet_id:
+        metadata = get_sheet_metadata(token, spreadsheet_token)
+        sheets = sorted(metadata.get("sheets", []), key=lambda item: item.get("index", 0))
+        if not sheets:
+            raise RuntimeError(f"No sheets found in spreadsheet: {url}")
+        sheet_id = sheets[0]["sheetId"]
+
+    return spreadsheet_token, sheet_id
+
+
+def get_sheet_plain_values(token, spreadsheet_token, sheet_id, range_str=None):
+    url = f"{BASE_URL}/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/{sheet_id}/values/batch_get_plain"
+    payload = {"ranges": [range_str or sheet_id]}
+    data = api_post(url, token, payload)
+    value_ranges = data["data"].get("value_ranges", [])
+    if not value_ranges:
+        return []
+    return value_ranges[0].get("values", [])
+
+
+def get_sheet_rich_values(token, spreadsheet_token, sheet_id, range_str):
+    url = f"{BASE_URL}/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/{sheet_id}/values/batch_get"
+    payload = {"ranges": [range_str]}
+    data = api_post(url, token, payload)
+    value_ranges = data["data"].get("value_ranges", [])
+    if not value_ranges:
+        return []
+    return value_ranges[0].get("values", [])
+
+
+def update_single_cell(token, spreadsheet_token, range_str, value):
+    url = f"{BASE_URL}/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values"
+    payload = {"valueRange": {"range": range_str, "values": [[value]]}}
+    api_put(url, token, payload)
+
+
+def get_cell(row, index):
+    if index >= len(row):
+        return ""
+    return row[index]
+
+
+def get_plain_cell_text(row, index):
+    value = get_cell(row, index)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def extract_rich_text(cell):
+    parts = []
+    for element in cell or []:
+        element_type = element.get("type")
+        if element_type == "text":
+            parts.append(element.get("text", {}).get("text", ""))
+        elif element_type == "link":
+            parts.append(element.get("link", {}).get("text", ""))
+        elif element_type == "mention_document":
+            parts.append(element.get("mention_document", {}).get("title", ""))
+        elif element_type == "mention_user":
+            parts.append(element.get("mention_user", {}).get("name", ""))
+        elif element_type == "value":
+            parts.append(str(element.get("value", {}).get("value", "")))
+    return "".join(parts).strip()
+
+
+def extract_link_url(cell):
+    for element in cell or []:
+        element_type = element.get("type")
+        if element_type == "link":
+            link = element.get("link", {}).get("link")
+            if link:
+                return link
+        if element_type == "mention_document":
+            document = element.get("mention_document", {})
+            if document.get("object_type") == "sheet" and document.get("token"):
+                return f"https://bytedance.larkoffice.com/sheets/{document['token']}"
+    return None
+
+
+def get_sheet_data(token):
+    spreadsheet_token = get_tracker_spreadsheet_token(token)
+    return get_sheet_plain_values(token, spreadsheet_token, SHEET_ID)
 
 
 def find_released_tasks(rows):
     if not rows:
         print("No data found in sheet.")
-        return
+        return []
 
     header = [str(cell).strip() if cell else "" for cell in rows[0]]
 
-    # Find column indices (case-insensitive search)
-    task_name_col = None
-    task_status_col = None
-    for i, h in enumerate(header):
-        h_lower = h.lower()
-        if "task name" in h_lower or "task" == h_lower:
-            task_name_col = i
-        if "task status" in h_lower:
-            task_status_col = i
-
-    if task_name_col is None or task_status_col is None:
-        print(f"Could not find required columns. Headers found: {header}")
-        return
+    task_name_col = find_column_index(header, "Task Name/Doc", "Task Name", "Task")
+    task_status_col = find_column_index(header, "Task Status", "Status")
 
     released_tasks = []
     for row in rows[1:]:
@@ -87,7 +245,6 @@ def find_released_tasks(rows):
 def get_base_records(token):
     """Fetch all records from the Base table view."""
     url = f"{BASE_URL}/open-apis/bitable/v1/apps/{BASE_APP_TOKEN}/tables/{BASE_TABLE_ID}/records/search"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     records = []
     page_token = None
 
@@ -96,11 +253,7 @@ def get_base_records(token):
         if page_token:
             payload["page_token"] = page_token
 
-        resp = requests.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != 0:
-            raise RuntimeError(f"Failed to fetch base records: {data}")
+        data = api_post(url, token, payload)
 
         items = data["data"].get("items", [])
         records.extend(items)
@@ -130,8 +283,23 @@ def extract_text(value):
     return str(value).strip()
 
 
+def extract_person_emails(value):
+    if not isinstance(value, list):
+        text = extract_text(value)
+        return [text] if text else []
+
+    emails = []
+    for person in value:
+        if not isinstance(person, dict):
+            continue
+        email = (person.get("email") or "").strip()
+        if email:
+            emails.append(email)
+    return emails
+
+
 def map_tasks_to_base(released_tasks, base_records):
-    """Match released tasks against Base records and return appeal initiators."""
+    """Match released tasks against Base records and return actionable appeal items."""
     # Build lookup: task name -> list of records (multiple appeals per task)
     base_lookup = {}
     for rec in base_records:
@@ -141,22 +309,123 @@ def map_tasks_to_base(released_tasks, base_records):
     print(f"\n{'Task Name':<55} {'Appeal Initiator Email':<45} {'Query':<45} {'Arbitrator Decision'}")
     print("-" * 170)
 
+    appeal_items = []
+
     for task_name in released_tasks:
         if task_name in base_lookup:
             for rec in base_lookup[task_name]:
                 initiator_raw = rec["fields"].get("Appeal Initiator")
-                if isinstance(initiator_raw, list):
-                    initiator = ", ".join(
-                        p.get("email") or p.get("name") or p.get("en_name", "")
-                        for p in initiator_raw
-                    )
-                else:
-                    initiator = extract_text(initiator_raw)
+                initiator_emails = extract_person_emails(initiator_raw)
+                initiator = ", ".join(initiator_emails) if initiator_emails else extract_text(initiator_raw)
                 query = extract_text(rec["fields"].get("Query", ""))
                 decision = extract_text(rec["fields"].get("Arbitrator Decision", ""))
-                if decision not in ("Edge Case", "Successful Appeal"):
+                if decision not in DECISIONS_TO_UPDATE:
                     continue
                 print(f"  {task_name:<53} {initiator or '(empty)':<45} {query or '(empty)':<45} {decision}")
+
+                appeal_items.append(
+                    {
+                        "task_name": task_name,
+                        "query": query,
+                        "initiator_emails": initiator_emails,
+                        "decision": decision,
+                    }
+                )
+
+    return appeal_items
+
+
+def build_tracker_link_lookup(token, rows):
+    spreadsheet_token = get_tracker_spreadsheet_token(token)
+    headers = [str(cell).strip() if cell else "" for cell in rows[0]]
+    extracted_col = find_column_index(headers, "Extracted/Appeal Doc", "Extracted/Appeal")
+    column = column_letter(extracted_col)
+    rich_range = f"{SHEET_ID}!{column}1:{column}{len(rows)}"
+    rich_values = get_sheet_rich_values(token, spreadsheet_token, SHEET_ID, rich_range)
+
+    link_lookup = {}
+    for row_index in range(1, len(rows)):
+        task_name = get_plain_cell_text(rows[row_index], extracted_col)
+        if not task_name:
+            continue
+        rich_cell = []
+        if row_index < len(rich_values) and rich_values[row_index]:
+            rich_cell = rich_values[row_index][0]
+        link_url = extract_link_url(rich_cell)
+        if not link_url and rich_cell:
+            link_text = extract_rich_text(rich_cell)
+            if link_text.startswith("http://") or link_text.startswith("https://"):
+                link_url = link_text
+
+        link_lookup.setdefault(task_name, []).append(
+            {"tracker_row": row_index + 1, "url": link_url}
+        )
+
+    return link_lookup
+
+
+def row_matches_query_and_email(row, query_col, user_col, query, emails):
+    row_query = normalize_text(get_plain_cell_text(row, query_col))
+    if row_query != normalize_text(query):
+        return False
+
+    user_value = normalize_text(get_plain_cell_text(row, user_col))
+    return any(normalize_text(email) and normalize_text(email) in user_value for email in emails)
+
+
+def update_accuracy_for_link(token, link_url, query, initiator_emails):
+    if not link_url:
+        return False, "missing link"
+
+    spreadsheet_token, sheet_id = resolve_sheet_target(token, link_url)
+    rows = get_sheet_plain_values(token, spreadsheet_token, sheet_id)
+    if not rows:
+        return False, "linked sheet is empty"
+
+    headers = [str(cell).strip() if cell else "" for cell in rows[0]]
+    query_col = find_column_index(headers, "Query")
+    user_col = find_column_index(headers, "User")
+    accuracy_col = find_column_index(headers, "Accuracy after appeal", "SP Accuracy After Appeal", "QA Accuracy After Appeal", "Accuracy After Appeal")
+
+    for row_index, row in enumerate(rows[1:], start=2):
+        if row_matches_query_and_email(row, query_col, user_col, query, initiator_emails):
+            accuracy_range = f"{sheet_id}!{column_letter(accuracy_col)}{row_index}:{column_letter(accuracy_col)}{row_index}"
+            update_single_cell(token, spreadsheet_token, accuracy_range, 1)
+            return True, f"updated {accuracy_range}"
+
+    return False, "no matching row found in linked sheet"
+
+
+def update_accuracy_after_appeal(token, rows, appeal_items):
+    link_lookup = build_tracker_link_lookup(token, rows)
+
+    print("\nUpdating linked spreadsheets:")
+    updated_count = 0
+
+    for item in appeal_items:
+        links = link_lookup.get(item["task_name"], [])
+        if not links:
+            print(f"  - {item['task_name']}: no matching row found in tracker sheet")
+            continue
+
+        item_updated = False
+        for link_info in links:
+            success, message = update_accuracy_for_link(
+                token,
+                link_info["url"],
+                item["query"],
+                item["initiator_emails"],
+            )
+            if success:
+                print(f"  - {item['task_name']}: {message}")
+                updated_count += 1
+                item_updated = True
+                break
+
+        if not item_updated:
+            print(f"  - {item['task_name']}: no linked row matched query + email")
+
+    print(f"\nAccuracy after appeal updated for {updated_count} item(s).")
 
 
 def main():
@@ -166,7 +435,9 @@ def main():
 
     if released_tasks:
         base_records = get_base_records(token)
-        map_tasks_to_base(released_tasks, base_records)
+        appeal_items = map_tasks_to_base(released_tasks, base_records)
+        if appeal_items:
+            update_accuracy_after_appeal(token, rows, appeal_items)
 
 
 if __name__ == "__main__":
