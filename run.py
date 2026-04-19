@@ -422,19 +422,21 @@ def read_accuracy_from_sheet1(token, spreadsheet_token, initiator_emails):
     if not rows:
         return None, None
 
-    # Find the column index of "after appeal" by scanning all rows for a header
+    # Find columns for "before appeal" and "after appeal"
+    before_appeal_col = None
     after_appeal_col = None
     for row in rows:
         headers = [str(cell).strip().lower() if cell else "" for cell in row]
         for idx, h in enumerate(headers):
             if "after appeal" in h:
                 after_appeal_col = idx
-                break
+            elif "before appeal" in h:
+                before_appeal_col = idx
         if after_appeal_col is not None:
             break
 
     if after_appeal_col is None:
-        return None, None
+        return None, None, None
 
     # Column B (index 1) contains emails — scan all rows for a match
     EMAIL_COL = 1
@@ -446,10 +448,11 @@ def read_accuracy_from_sheet1(token, spreadsheet_token, initiator_emails):
             continue
         if any(e and e in cell_value for e in norm_emails):
             display_name = get_plain_cell_text(row, EMAIL_COL)
+            before_value = get_plain_cell_text(row, before_appeal_col) if before_appeal_col is not None else None
             accuracy_value = get_plain_cell_text(row, after_appeal_col)
-            return display_name, accuracy_value
+            return display_name, before_value, accuracy_value
 
-    return None, None
+    return None, None, None
 
 
 def update_perf_tracker_row(token, perf_spt, task_name, email, accuracy_value):
@@ -492,6 +495,7 @@ def sync_perf_tracker(token, appeal_items, link_lookup):
 
     print("\nSyncing individual performance tracker from linked Sheet1:")
     synced = 0
+    sync_results = []  # list of {task_name, email, accuracy_value}
 
     for item in appeal_items:
         links = link_lookup.get(item["task_name"], [])
@@ -499,22 +503,31 @@ def sync_perf_tracker(token, appeal_items, link_lookup):
             if not link_info.get("spreadsheet_token"):
                 continue
             spt = link_info["spreadsheet_token"]
-            display_name, accuracy_value = read_accuracy_from_sheet1(token, spt, item["initiator_emails"])
+            display_name, before_value, accuracy_value = read_accuracy_from_sheet1(token, spt, item["initiator_emails"])
             if display_name is None:
                 print(f"  - {item['task_name']}: could not find email/accuracy in Sheet1")
                 continue
+            raw_accuracy = accuracy_value
             # Convert "93.69%" -> 0.9369
             if isinstance(accuracy_value, str) and accuracy_value.endswith("%"):
                 try:
                     accuracy_value = round(float(accuracy_value.rstrip("%")) / 100, 6)
                 except ValueError:
                     pass
-            print(f"  - {item['task_name']} / {display_name}: accuracy={accuracy_value}")
+            print(f"  - {item['task_name']} / {display_name}: before={before_value} after={raw_accuracy}")
             if update_perf_tracker_row(token, perf_spt, item["task_name"], display_name, accuracy_value):
                 synced += 1
+            sync_results.append({
+                "task_name": item["task_name"],
+                "email": display_name,
+                "decision": item["decision"],
+                "before": before_value,
+                "accuracy": raw_accuracy,
+            })
             break
 
     print(f"\nPerformance tracker synced for {synced} item(s).")
+    return synced, sync_results
 
 
 def update_accuracy_after_appeal(token, rows, appeal_items):
@@ -552,6 +565,101 @@ def update_accuracy_after_appeal(token, rows, appeal_items):
     return link_lookup
 
 
+REPORT_GROUP_ID = "oc_a4a0073645667c471721385b5e1d572c"
+
+
+def send_summary_card(token, appeal_items, linked_updated, perf_synced, sync_results):
+    """Send an interactive summary card to the report group chat."""
+    import json
+    from datetime import date
+
+    today = date.today().strftime("%Y-%m-%d")
+
+    # Build rows from sync_results (has accuracy)
+    rows_elements = []
+    for r in sync_results:
+        rows_elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "columns": [
+                {"tag": "column", "width": "weighted", "weight": 3, "elements": [
+                    {"tag": "markdown", "content": r["task_name"]}
+                ]},
+                {"tag": "column", "width": "weighted", "weight": 2, "elements": [
+                    {"tag": "markdown", "content": r["email"]}
+                ]},
+                {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                    {"tag": "markdown", "content": r["decision"]}
+                ]},
+                {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                    {"tag": "markdown", "content": str(r["before"]) if r.get("before") else "-"}
+                ]},
+                {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                    {"tag": "markdown", "content": str(r["accuracy"]) if r["accuracy"] else "-"}
+                ]},
+            ]
+        })
+
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"Appeal Automation Report — {today}"},
+            "template": "blue"
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"**Released tasks processed:** {len(appeal_items)}\n**Linked sheets updated:** {linked_updated}\n**Performance tracker rows synced:** {perf_synced}"}
+            },
+            {"tag": "hr"},
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "**Accuracy After Appeal per person:**"}
+            },
+            # Header row
+            {
+                "tag": "column_set",
+                "flex_mode": "none",
+                "background_style": "grey",
+                "columns": [
+                    {"tag": "column", "width": "weighted", "weight": 3, "elements": [
+                        {"tag": "markdown", "content": "**Task Name**"}
+                    ]},
+                    {"tag": "column", "width": "weighted", "weight": 2, "elements": [
+                        {"tag": "markdown", "content": "**Email**"}
+                    ]},
+                    {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                        {"tag": "markdown", "content": "**Decision**"}
+                    ]},
+                    {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                        {"tag": "markdown", "content": "**Before Appeal**"}
+                    ]},
+                    {"tag": "column", "width": "weighted", "weight": 1, "elements": [
+                        {"tag": "markdown", "content": "**After Appeal**"}
+                    ]},
+                ]
+            },
+            *rows_elements,
+        ]
+    }
+
+    url = f"{BASE_URL}/open-apis/im/v1/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "receive_id": REPORT_GROUP_ID,
+        "msg_type": "interactive",
+        "content": json.dumps(card),
+    }
+    resp = requests.post(url, headers=headers, params={"receive_id_type": "chat_id"}, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        print(f"  Warning: Failed to send card: {data}")
+    else:
+        print("  Summary card sent to group.")
+
+
 def main():
     token = get_tenant_access_token()
     rows = get_sheet_data(token)
@@ -562,7 +670,10 @@ def main():
         appeal_items = map_tasks_to_base(released_tasks, base_records)
         if appeal_items:
             link_lookup = update_accuracy_after_appeal(token, rows, appeal_items)
-            sync_perf_tracker(token, appeal_items, link_lookup)
+            linked_updated = sum(1 for item in appeal_items for l in link_lookup.get(item["task_name"], []) if l.get("spreadsheet_token"))
+            synced_count, sync_results = sync_perf_tracker(token, appeal_items, link_lookup)
+            print("\nSending summary card...")
+            send_summary_card(token, appeal_items, linked_updated, synced_count, sync_results)
 
 
 if __name__ == "__main__":
