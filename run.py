@@ -322,8 +322,13 @@ def map_tasks_to_base(released_tasks, base_records):
                 query = extract_text(rec["fields"].get("Query", ""))
                 poc_decision = extract_text(rec["fields"].get("POC Decision", ""))
                 arbitrator_decision = extract_text(rec["fields"].get("Arbitrator Decision", ""))
-                decision = poc_decision if poc_decision else arbitrator_decision
-                if decision not in DECISIONS_TO_UPDATE:
+                if poc_decision in DECISIONS_TO_UPDATE:
+                    decision = poc_decision
+                elif poc_decision == "Failed Appeal" and arbitrator_decision in DECISIONS_TO_UPDATE:
+                    decision = "POC Failed"
+                elif not poc_decision and arbitrator_decision in DECISIONS_TO_UPDATE:
+                    decision = arbitrator_decision
+                else:
                     continue
                 qa_raw = rec["fields"].get("Quality Analyst")
                 qa_emails = extract_person_emails(qa_raw) if qa_raw else []
@@ -574,6 +579,18 @@ def sync_perf_tracker(token, appeal_items, link_lookup):
                             qa_write_value = round(float(qa_write_value.rstrip("%")) / 100, 6)
                         except ValueError:
                             pass
+                elif item["decision"] == "POC Failed":
+                    # QA's after-appeal = QA's own before-appeal
+                    qa_before_raw = read_sp_before_from_link(token, link_info["url"], item["query"], item["qa_emails"])
+                    if not qa_before_raw:
+                        print(f"  - QA: could not read QA before appeal for {item['task_name']}")
+                        break
+                    qa_write_value = qa_before_raw
+                    if isinstance(qa_write_value, str) and qa_write_value.endswith("%"):
+                        try:
+                            qa_write_value = round(float(qa_write_value.rstrip("%")) / 100, 6)
+                        except ValueError:
+                            pass
                 else:
                     break
 
@@ -634,6 +651,25 @@ def update_accuracy_after_appeal(token, rows, appeal_items):
                         print(f"  - {item['task_name']}: Both Wrong — SP not updated")
                     except Exception as e:
                         print(f"  - {item['task_name']}: could not resolve sheet token: {e}")
+                break
+            if item["decision"] == "POC Failed":
+                # SP's after-appeal = SP's own before-appeal (no change in accuracy)
+                if link_info.get("url"):
+                    sp_before = read_sp_before_from_link(token, link_info["url"], item["query"], item["initiator_emails"])
+                    if sp_before:
+                        if isinstance(sp_before, str) and sp_before.endswith("%"):
+                            try:
+                                sp_before = round(float(sp_before.rstrip("%")) / 100, 6)
+                            except ValueError:
+                                pass
+                        success, message, spt = update_accuracy_for_link(token, link_info["url"], item["query"], item["initiator_emails"], value=sp_before)
+                        link_info["spreadsheet_token"] = spt
+                        if success:
+                            print(f"  - {item['task_name']}: POC Failed — SP after-appeal reset to before-appeal")
+                            updated_count += 1
+                            item_updated = True
+                    else:
+                        print(f"  - {item['task_name']}: POC Failed — could not read SP before-appeal")
                 break
             success, message, spt = update_accuracy_for_link(
                 token,
