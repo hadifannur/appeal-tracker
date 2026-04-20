@@ -18,7 +18,7 @@ BASE_VIEW_ID = os.getenv("BASE_VIEW_ID")
 REPORT_GROUP_ID = os.getenv("REPORT_GROUP_ID")
 
 BASE_URL = "https://open.larkoffice.com"
-DECISIONS_TO_UPDATE = {"Edge Case", "Successful Appeal"}
+DECISIONS_TO_UPDATE = {"Edge Case", "Successful Appeal", "Both Wrong"}
 PERF_TRACKER_SHEET_ID = "FVqt9p"
 
 
@@ -537,34 +537,37 @@ def sync_perf_tracker(token, appeal_items, link_lookup):
             if not link_info.get("spreadsheet_token"):
                 continue
             spt = link_info["spreadsheet_token"]
-            display_name, before_value, accuracy_value = read_accuracy_from_sheet1(token, spt, item["initiator_emails"])
-            if display_name is None:
-                print(f"  - {item['task_name']}: could not find email/accuracy in Sheet1")
-                continue
-            raw_accuracy = accuracy_value
-            # Convert "93.69%" -> 0.9369
-            if isinstance(accuracy_value, str) and accuracy_value.endswith("%"):
-                try:
-                    accuracy_value = round(float(accuracy_value.rstrip("%")) / 100, 6)
-                except ValueError:
-                    pass
-            print(f"  - {item['task_name']} / {display_name}: before={before_value} after={raw_accuracy}")
-            if update_perf_tracker_row(token, perf_spt, item["task_name"], display_name, accuracy_value):
-                synced += 1
-            sync_results.append({
-                "task_name": item["task_name"],
-                "email": display_name,
-                "decision": item["decision"],
-                "before": before_value,
-                "accuracy": raw_accuracy,
-            })
+
+            # SP: skip perf tracker update for Both Wrong
+            if item["decision"] != "Both Wrong":
+                display_name, before_value, accuracy_value = read_accuracy_from_sheet1(token, spt, item["initiator_emails"])
+                if display_name is None:
+                    print(f"  - {item['task_name']}: could not find email/accuracy in Sheet1")
+                    continue
+                raw_accuracy = accuracy_value
+                # Convert "93.69%" -> 0.9369
+                if isinstance(accuracy_value, str) and accuracy_value.endswith("%"):
+                    try:
+                        accuracy_value = round(float(accuracy_value.rstrip("%")) / 100, 6)
+                    except ValueError:
+                        pass
+                print(f"  - {item['task_name']} / {display_name}: before={before_value} after={raw_accuracy}")
+                if update_perf_tracker_row(token, perf_spt, item["task_name"], display_name, accuracy_value):
+                    synced += 1
+                sync_results.append({
+                    "task_name": item["task_name"],
+                    "email": display_name,
+                    "decision": item["decision"],
+                    "before": before_value,
+                    "accuracy": raw_accuracy,
+                })
 
             # QA 3-step flow (same as SP)
             if item.get("qa_emails"):
                 # Determine value to write into QA's accuracy after appeal cell
                 if item["decision"] == "Edge Case":
                     qa_write_value = 1
-                elif item["decision"] == "Successful Appeal":
+                elif item["decision"] in ("Successful Appeal", "Both Wrong"):
                     # Read SP's before appeal from column R of linked task data sheet
                     sp_before_raw = read_sp_before_from_link(token, link_info["url"], item["query"], item["initiator_emails"])
                     if not sp_before_raw:
@@ -626,6 +629,17 @@ def update_accuracy_after_appeal(token, rows, appeal_items):
 
         item_updated = False
         for link_info in links:
+            if item["decision"] == "Both Wrong":
+                # SP stays the same — just resolve the spreadsheet token for Sheet1 sync
+                if link_info.get("url"):
+                    try:
+                        spt, _ = resolve_sheet_target(token, link_info["url"])
+                        link_info["spreadsheet_token"] = spt
+                        item_updated = True
+                        print(f"  - {item['task_name']}: Both Wrong — SP not updated")
+                    except Exception as e:
+                        print(f"  - {item['task_name']}: could not resolve sheet token: {e}")
+                break
             success, message, spt = update_accuracy_for_link(
                 token,
                 link_info["url"],
