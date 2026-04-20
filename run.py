@@ -1,5 +1,5 @@
 import os
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -364,9 +364,7 @@ def build_tracker_link_lookup(token, rows):
             if link_text.startswith("http://") or link_text.startswith("https://"):
                 link_url = link_text
 
-        link_lookup.setdefault(task_name, []).append(
-            {"tracker_row": row_index + 1, "url": link_url}
-        )
+        link_lookup.setdefault(task_name, []).append({"url": link_url})
 
     return link_lookup
 
@@ -391,15 +389,12 @@ def read_sp_before_from_link(token, link_url, query, initiator_emails):
         return None
 
     headers = [str(cell).strip() if cell else "" for cell in rows[0]]
+    query_col = find_column_index(headers, "Query")
+    user_col = find_column_index(headers, "User")
     try:
-        query_col = find_column_index(headers, "Query")
-        user_col = find_column_index(headers, "User")
         before_col = find_column_index(headers, "Accuracy before appeal", "SP Accuracy Before Appeal", "Accuracy Before Appeal")
     except RuntimeError:
-        # Fallback to column R (index 17)
-        query_col = find_column_index(headers, "Query")
-        user_col = find_column_index(headers, "User")
-        before_col = 17
+        before_col = 17  # Fallback to column R
 
     for row in rows[1:]:
         if row_matches_query_and_email(row, query_col, user_col, query, initiator_emails):
@@ -454,7 +449,7 @@ def read_accuracy_from_sheet1(token, spreadsheet_token, initiator_emails):
     sheet1_id = get_sheet1_id(token, spreadsheet_token)
     rows = get_sheet_plain_values(token, spreadsheet_token, sheet1_id)
     if not rows:
-        return None, None
+        return None, None, None
 
     # Find columns for "before appeal" and "after appeal"
     before_appeal_col = None
