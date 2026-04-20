@@ -15,6 +15,7 @@ SHEET_ID = os.getenv("SHEET_ID")
 BASE_APP_TOKEN = os.getenv("BASE_APP_TOKEN")
 BASE_TABLE_ID = os.getenv("BASE_TABLE_ID")
 BASE_VIEW_ID = os.getenv("BASE_VIEW_ID")
+REPORT_GROUP_ID = os.getenv("REPORT_GROUP_ID")
 
 BASE_URL = "https://open.larkoffice.com"
 DECISIONS_TO_UPDATE = {"Edge Case", "Successful Appeal"}
@@ -319,9 +320,13 @@ def map_tasks_to_base(released_tasks, base_records):
                 initiator_emails = extract_person_emails(initiator_raw)
                 initiator = ", ".join(initiator_emails) if initiator_emails else extract_text(initiator_raw)
                 query = extract_text(rec["fields"].get("Query", ""))
-                decision = extract_text(rec["fields"].get("Arbitrator Decision", ""))
+                poc_decision = extract_text(rec["fields"].get("POC Decision", ""))
+                arbitrator_decision = extract_text(rec["fields"].get("Arbitrator Decision", ""))
+                decision = poc_decision if poc_decision else arbitrator_decision
                 if decision not in DECISIONS_TO_UPDATE:
                     continue
+                qa_raw = rec["fields"].get("Quality Analyst")
+                qa_emails = extract_person_emails(qa_raw) if qa_raw else []
                 print(f"  {task_name:<53} {initiator or '(empty)':<45} {query or '(empty)':<45} {decision}")
 
                 appeal_items.append(
@@ -329,6 +334,7 @@ def map_tasks_to_base(released_tasks, base_records):
                         "task_name": task_name,
                         "query": query,
                         "initiator_emails": initiator_emails,
+                        "qa_emails": qa_emails,
                         "decision": decision,
                     }
                 )
@@ -374,7 +380,35 @@ def row_matches_query_and_email(row, query_col, user_col, query, emails):
     return any(normalize_text(email) and normalize_text(email) in user_value for email in emails)
 
 
-def update_accuracy_for_link(token, link_url, query, initiator_emails):
+def read_sp_before_from_link(token, link_url, query, initiator_emails):
+    """Read SP's Accuracy Before Appeal (column R, index 17) from the linked task data sheet."""
+    if not link_url:
+        return None
+
+    spreadsheet_token, sheet_id = resolve_sheet_target(token, link_url)
+    rows = get_sheet_plain_values(token, spreadsheet_token, sheet_id)
+    if not rows:
+        return None
+
+    headers = [str(cell).strip() if cell else "" for cell in rows[0]]
+    try:
+        query_col = find_column_index(headers, "Query")
+        user_col = find_column_index(headers, "User")
+        before_col = find_column_index(headers, "Accuracy before appeal", "SP Accuracy Before Appeal", "Accuracy Before Appeal")
+    except RuntimeError:
+        # Fallback to column R (index 17)
+        query_col = find_column_index(headers, "Query")
+        user_col = find_column_index(headers, "User")
+        before_col = 17
+
+    for row in rows[1:]:
+        if row_matches_query_and_email(row, query_col, user_col, query, initiator_emails):
+            return get_plain_cell_text(row, before_col) or None
+
+    return None
+
+
+def update_accuracy_for_link(token, link_url, query, initiator_emails, value=1):
     """Update Accuracy after appeal in the linked sheet. Returns (success, message, spreadsheet_token)."""
     if not link_url:
         return False, "missing link", None
@@ -392,7 +426,7 @@ def update_accuracy_for_link(token, link_url, query, initiator_emails):
     for row_index, row in enumerate(rows[1:], start=2):
         if row_matches_query_and_email(row, query_col, user_col, query, initiator_emails):
             accuracy_range = f"{sheet_id}!{column_letter(accuracy_col)}{row_index}:{column_letter(accuracy_col)}{row_index}"
-            update_single_cell(token, spreadsheet_token, accuracy_range, 1)
+            update_single_cell(token, spreadsheet_token, accuracy_range, value)
             return True, f"updated {accuracy_range}", spreadsheet_token
 
     return False, "no matching row found in linked sheet", spreadsheet_token
@@ -524,6 +558,54 @@ def sync_perf_tracker(token, appeal_items, link_lookup):
                 "before": before_value,
                 "accuracy": raw_accuracy,
             })
+
+            # QA 3-step flow (same as SP)
+            if item.get("qa_emails"):
+                # Determine value to write into QA's accuracy after appeal cell
+                if item["decision"] == "Edge Case":
+                    qa_write_value = 1
+                elif item["decision"] == "Successful Appeal":
+                    # Read SP's before appeal from column R of linked task data sheet
+                    sp_before_raw = read_sp_before_from_link(token, link_info["url"], item["query"], item["initiator_emails"])
+                    if not sp_before_raw:
+                        print(f"  - QA: could not read SP before appeal for {item['task_name']}")
+                        break
+                    qa_write_value = sp_before_raw
+                    if isinstance(qa_write_value, str) and qa_write_value.endswith("%"):
+                        try:
+                            qa_write_value = round(float(qa_write_value.rstrip("%")) / 100, 6)
+                        except ValueError:
+                            pass
+                else:
+                    break
+
+                # Step 1: write value into QA's accuracy after appeal in linked task data sheet
+                update_accuracy_for_link(token, link_info["url"], item["query"], item["qa_emails"], value=qa_write_value)
+
+                # Step 2: read Sheet1 with QA emails
+                qa_display, qa_before, qa_accuracy = read_accuracy_from_sheet1(token, spt, item["qa_emails"])
+                if qa_display is None:
+                    print(f"  - QA: could not find QA in Sheet1 for {item['task_name']}")
+                    break
+
+                raw_qa_accuracy = qa_accuracy
+                if isinstance(qa_accuracy, str) and qa_accuracy.endswith("%"):
+                    try:
+                        qa_accuracy = round(float(qa_accuracy.rstrip("%")) / 100, 6)
+                    except ValueError:
+                        pass
+
+                # Step 3: write to individual perf tracker
+                print(f"  - QA ({item['decision']}): {qa_display} / {item['task_name']} -> {raw_qa_accuracy}")
+                if update_perf_tracker_row(token, perf_spt, item["task_name"], qa_display, qa_accuracy):
+                    synced += 1
+                sync_results.append({
+                    "task_name": item["task_name"],
+                    "email": qa_display,
+                    "decision": f"{item['decision']} (QA)",
+                    "before": qa_before or "-",
+                    "accuracy": raw_qa_accuracy,
+                })
             break
 
     print(f"\nPerformance tracker synced for {synced} item(s).")
@@ -564,8 +646,6 @@ def update_accuracy_after_appeal(token, rows, appeal_items):
     print(f"\nAccuracy after appeal updated for {updated_count} item(s).")
     return link_lookup
 
-
-REPORT_GROUP_ID = "oc_a4a0073645667c471721385b5e1d572c"
 
 
 def send_summary_card(token, appeal_items, linked_updated, perf_synced, sync_results):
