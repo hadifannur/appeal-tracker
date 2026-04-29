@@ -46,7 +46,8 @@ def api_get(url, token, params=None):
 def api_post(url, token, payload):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     resp = requests.post(url, headers=headers, json=payload)
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(f"POST {resp.status_code} for {url} | body: {resp.text} | payload: {payload}")
     data = resp.json()
     if data.get("code") != 0:
         raise RuntimeError(f"POST failed: {url} -> {data}")
@@ -122,24 +123,40 @@ def get_sheet_metadata(token, spreadsheet_token):
     return data["data"]
 
 
+def get_sheet_properties(token, spreadsheet_token, sheet_id):
+    url = f"{BASE_URL}/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/{sheet_id}"
+    data = api_get(url, token)
+    return data["data"]["sheet"]
+
+
+def col_num_to_letter(n):
+    result = ""
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
 def resolve_sheet_target(token, url):
     resource = parse_sheet_resource(url)
     spreadsheet_token = resolve_spreadsheet_token(token, resource)
     sheet_id = resource["sheet_id"]
 
     if not sheet_id:
-        metadata = get_sheet_metadata(token, spreadsheet_token)
-        sheets = sorted(metadata.get("sheets", []), key=lambda item: item.get("index", 0))
-        if not sheets:
-            raise RuntimeError(f"No sheets found in spreadsheet: {url}")
-        sheet_id = sheets[0]["sheetId"]
+        sheet_id = get_task_data_record_id(token, spreadsheet_token)
 
     return spreadsheet_token, sheet_id
 
 
 def get_sheet_plain_values(token, spreadsheet_token, sheet_id, range_str=None):
     url = f"{BASE_URL}/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/{sheet_id}/values/batch_get_plain"
-    payload = {"ranges": [range_str or sheet_id]}
+    if not range_str:
+        props = get_sheet_properties(token, spreadsheet_token, sheet_id)
+        grid = props.get("grid_properties", {})
+        col_count = grid.get("column_count", 26)
+        row_count = grid.get("row_count", 1000)
+        range_str = f"{sheet_id}!A1:{col_num_to_letter(col_count)}{row_count}"
+    payload = {"ranges": [range_str]}
     data = api_post(url, token, payload)
     value_ranges = data["data"].get("value_ranges", [])
     if not value_ranges:
@@ -446,45 +463,75 @@ def get_sheet1_id(token, spreadsheet_token):
     return sheets_sorted[0]["sheetId"]
 
 
-def read_accuracy_from_sheet1(token, spreadsheet_token, initiator_emails):
-    """Read Sheet1 of the linked spreadsheet, find the row matching the initiator email
-    (column B, no header), and return (email, after_appeal_value).
-    Sheet1 structure: col B = email, col J = 'after appeal'.
-    Header rows can appear multiple times (SP section row 1, QA section row ~15)."""
-    sheet1_id = get_sheet1_id(token, spreadsheet_token)
-    rows = get_sheet_plain_values(token, spreadsheet_token, sheet1_id)
+def get_task_data_record_id(token, spreadsheet_token):
+    """Return the sheetId of the tab named 'Task Data Record', falling back to the first sheet."""
+    metadata = get_sheet_metadata(token, spreadsheet_token)
+    sheets = metadata.get("sheets", [])
+    for sheet in sheets:
+        if sheet.get("title", "").strip().lower() == "task data record":
+            return sheet["sheetId"]
+    # Fallback: first sheet by index
+    sheets_sorted = sorted(sheets, key=lambda s: s.get("index", 0))
+    if not sheets_sorted:
+        raise RuntimeError(f"No sheets found in spreadsheet: {spreadsheet_token}")
+    return sheets_sorted[0]["sheetId"]
+
+
+def read_accuracy_from_sheet1(token, spreadsheet_token, emails, query=None):
+    """Read Sheet1 of the linked spreadsheet, find the row matching email (and optionally query),
+    and return (user, before_appeal_value, after_appeal_value)."""
+    sheet_id = get_sheet1_id(token, spreadsheet_token)
+    rows = get_sheet_plain_values(token, spreadsheet_token, sheet_id)
     if not rows:
         return None, None, None
 
-    # Find columns for "before appeal" and "after appeal"
-    before_appeal_col = None
+    # Scan all rows for a header row (Sheet1 may have multiple sections)
+    user_col = None
+    query_col = None
     after_appeal_col = None
-    for row in rows:
-        headers = [str(cell).strip().lower() if cell else "" for cell in row]
-        for idx, h in enumerate(headers):
-            if "after appeal" in h:
-                after_appeal_col = idx
-            elif "before appeal" in h:
-                before_appeal_col = idx
-        if after_appeal_col is not None:
+    before_appeal_col = None
+    header_row_index = None
+
+    for i, row in enumerate(rows):
+        headers = [str(cell).strip() if cell else "" for cell in row]
+        headers_lower = [h.lower() for h in headers]
+        if any("after appeal" in h for h in headers_lower):
+            header_row_index = i
+            for idx, h in enumerate(headers_lower):
+                if "after appeal" in h:
+                    after_appeal_col = idx
+                if "before appeal" in h:
+                    before_appeal_col = idx
+                if h == "user":
+                    user_col = idx
+                if h == "query":
+                    query_col = idx
             break
 
     if after_appeal_col is None:
         return None, None, None
 
-    # Column B (index 1) contains emails — scan all rows for a match
-    EMAIL_COL = 1
-    norm_emails = [normalize_text(e) for e in initiator_emails if e]
+    # Email col fallback: col B (index 1) if no "User" header found
+    if user_col is None:
+        user_col = 1
 
-    for row in rows:
-        cell_value = normalize_text(get_plain_cell_text(row, EMAIL_COL))
-        if not cell_value:
+    norm_emails = [normalize_text(e) for e in emails if e]
+    start = (header_row_index + 1) if header_row_index is not None else 0
+
+    for row in rows[start:]:
+        user_value = normalize_text(get_plain_cell_text(row, user_col))
+        if not user_value:
             continue
-        if any(e and e in cell_value for e in norm_emails):
-            display_name = get_plain_cell_text(row, EMAIL_COL)
-            before_value = get_plain_cell_text(row, before_appeal_col) if before_appeal_col is not None else None
-            accuracy_value = get_plain_cell_text(row, after_appeal_col)
-            return display_name, before_value, accuracy_value
+        if not any(e and e in user_value for e in norm_emails):
+            continue
+        if query and query_col is not None:
+            row_query = normalize_text(get_plain_cell_text(row, query_col))
+            if row_query != normalize_text(query):
+                continue
+        display_name = get_plain_cell_text(row, user_col)
+        before_value = get_plain_cell_text(row, before_appeal_col) if before_appeal_col is not None else None
+        accuracy_value = get_plain_cell_text(row, after_appeal_col)
+        return display_name, before_value, accuracy_value
 
     return None, None, None
 
@@ -540,7 +587,7 @@ def sync_perf_tracker(token, appeal_items, link_lookup):
 
             # SP: skip perf tracker update for Both Wrong
             if item["decision"] != "Both Wrong":
-                display_name, before_value, accuracy_value = read_accuracy_from_sheet1(token, spt, item["initiator_emails"])
+                display_name, before_value, accuracy_value = read_accuracy_from_sheet1(token, spt, item["initiator_emails"], item["query"])
                 if display_name is None:
                     print(f"  - {item['task_name']}: could not find email/accuracy in Sheet1")
                     continue
@@ -598,7 +645,7 @@ def sync_perf_tracker(token, appeal_items, link_lookup):
                 update_accuracy_for_link(token, link_info["url"], item["query"], item["qa_emails"], value=qa_write_value)
 
                 # Step 2: read Sheet1 with QA emails
-                qa_display, qa_before, qa_accuracy = read_accuracy_from_sheet1(token, spt, item["qa_emails"])
+                qa_display, qa_before, qa_accuracy = read_accuracy_from_sheet1(token, spt, item["qa_emails"], item["query"])
                 if qa_display is None:
                     print(f"  - QA: could not find QA in Sheet1 for {item['task_name']}")
                     break
