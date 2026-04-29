@@ -244,7 +244,7 @@ def find_released_tasks(rows):
         if len(row) <= max(task_name_col, task_status_col):
             continue
         status = str(row[task_status_col]).strip() if row[task_status_col] else ""
-        if status == "Appeal Has Been Released":
+        if status in ("Appeal Has Been Released", "Pending Completion from QA"):
             cell = row[task_name_col]
             if isinstance(cell, list) and cell and isinstance(cell[0], dict):
                 task_name = cell[0].get("text", "").strip()
@@ -254,7 +254,7 @@ def find_released_tasks(rows):
                 task_name = ""
             released_tasks.append(task_name)
 
-    print(f"\nTasks with status 'Appeal Has Been Released' ({len(released_tasks)} found):")
+    print(f"\nTasks with status 'Appeal Has Been Released' or 'Pending Completion from QA' ({len(released_tasks)} found):")
     for name in released_tasks:
         print(f"  - {name}")
 
