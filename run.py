@@ -339,6 +339,11 @@ def map_tasks_to_base(released_tasks, base_records):
                 query = extract_text(rec["fields"].get("Query", ""))
                 poc_decision = extract_text(rec["fields"].get("POC Decision", ""))
                 arbitrator_decision = extract_text(rec["fields"].get("Arbitrator Decision", ""))
+                eval_round_dispute = extract_text(rec["fields"].get("Evaluation Round Dispute", ""))
+                force_sp_qa_one = (
+                    normalize_text(arbitrator_decision) == "successful appeal"
+                    and normalize_text(eval_round_dispute) == "poc round"
+                )
                 if poc_decision in DECISIONS_TO_UPDATE:
                     decision = poc_decision
                 elif poc_decision == "Failed Appeal" and arbitrator_decision in DECISIONS_TO_UPDATE:
@@ -358,6 +363,7 @@ def map_tasks_to_base(released_tasks, base_records):
                         "initiator_emails": initiator_emails,
                         "qa_emails": qa_emails,
                         "decision": decision,
+                        "force_sp_qa_one": force_sp_qa_one,
                     }
                 )
 
@@ -585,8 +591,8 @@ def sync_perf_tracker(token, appeal_items, link_lookup):
                 continue
             spt = link_info["spreadsheet_token"]
 
-            # SP: skip perf tracker update for Both Wrong
-            if item["decision"] != "Both Wrong":
+            # SP: normally skip perf tracker update for Both Wrong, unless forced override applies
+            if item.get("force_sp_qa_one") or item["decision"] != "Both Wrong":
                 display_name, before_value, accuracy_value = read_accuracy_from_sheet1(token, spt, item["initiator_emails"], item["query"])
                 if display_name is None:
                     print(f"  - {item['task_name']}: could not find email/accuracy in Sheet1")
@@ -612,7 +618,9 @@ def sync_perf_tracker(token, appeal_items, link_lookup):
             # QA 3-step flow (same as SP)
             if item.get("qa_emails"):
                 # Determine value to write into QA's accuracy after appeal cell
-                if item["decision"] == "Edge Case":
+                if item.get("force_sp_qa_one"):
+                    qa_write_value = 1
+                elif item["decision"] == "Edge Case":
                     qa_write_value = 1
                 elif item["decision"] in ("Successful Appeal", "Both Wrong"):
                     # Read SP's before appeal from column R of linked task data sheet
@@ -688,6 +696,20 @@ def update_accuracy_after_appeal(token, rows, appeal_items):
 
         item_updated = False
         for link_info in links:
+            if item.get("force_sp_qa_one"):
+                success, message, spt = update_accuracy_for_link(
+                    token,
+                    link_info["url"],
+                    item["query"],
+                    item["initiator_emails"],
+                    value=1,
+                )
+                link_info["spreadsheet_token"] = spt
+                if success:
+                    print(f"  - {item['task_name']}: forced override applied — SP after-appeal set to 1")
+                    updated_count += 1
+                    item_updated = True
+                break
             if item["decision"] == "Both Wrong":
                 # SP stays the same — just resolve the spreadsheet token for Sheet1 sync
                 if link_info.get("url"):
