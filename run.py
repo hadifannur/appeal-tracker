@@ -769,31 +769,24 @@ def send_summary_card(token, appeal_items, linked_updated, perf_synced, sync_res
 
     today = date.today().strftime("%Y-%m-%d")
 
-    # Build rows from sync_results (has accuracy)
-    rows_elements = []
-    for r in sync_results:
-        rows_elements.append({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "background_style": "default",
-            "columns": [
-                {"tag": "column", "width": "weighted", "weight": 3, "elements": [
-                    {"tag": "markdown", "content": r["task_name"]}
-                ]},
-                {"tag": "column", "width": "weighted", "weight": 2, "elements": [
-                    {"tag": "markdown", "content": r["email"]}
-                ]},
-                {"tag": "column", "width": "weighted", "weight": 1, "elements": [
-                    {"tag": "markdown", "content": r["decision"]}
-                ]},
-                {"tag": "column", "width": "weighted", "weight": 1, "elements": [
-                    {"tag": "markdown", "content": str(r["before"]) if r.get("before") else "-"}
-                ]},
-                {"tag": "column", "width": "weighted", "weight": 1, "elements": [
-                    {"tag": "markdown", "content": str(r["accuracy"]) if r["accuracy"] else "-"}
-                ]},
-            ]
-        })
+    # Count decisions
+    successful = [item for item in appeal_items if item["decision"] == "Successful Appeal" or item.get("force_sp_qa_one")]
+    edge_cases = [item for item in appeal_items if item["decision"] == "Edge Case" and not item.get("force_sp_qa_one")]
+
+    def task_list(items):
+        seen = []
+        for item in items:
+            if item["task_name"] not in seen:
+                seen.append(item["task_name"])
+        return "\n".join(f"• {t}" for t in seen) if seen else "-"
+
+    summary_text = (
+        f"**Released tasks processed:** {len(appeal_items)}\n"
+        f"**Linked sheets updated:** {linked_updated}\n"
+        f"**Performance tracker rows synced:** {perf_synced}\n\n"
+        f"**Successful Appeals ({len(successful)}):**\n{task_list(successful)}\n\n"
+        f"**Edge Cases ({len(edge_cases)}):**\n{task_list(edge_cases)}"
+    )
 
     card = {
         "config": {"wide_screen_mode": True},
@@ -804,37 +797,8 @@ def send_summary_card(token, appeal_items, linked_updated, perf_synced, sync_res
         "elements": [
             {
                 "tag": "div",
-                "text": {"tag": "lark_md", "content": f"**Released tasks processed:** {len(appeal_items)}\n**Linked sheets updated:** {linked_updated}\n**Performance tracker rows synced:** {perf_synced}"}
+                "text": {"tag": "lark_md", "content": summary_text}
             },
-            {"tag": "hr"},
-            {
-                "tag": "div",
-                "text": {"tag": "lark_md", "content": "**Accuracy After Appeal per person:**"}
-            },
-            # Header row
-            {
-                "tag": "column_set",
-                "flex_mode": "none",
-                "background_style": "grey",
-                "columns": [
-                    {"tag": "column", "width": "weighted", "weight": 3, "elements": [
-                        {"tag": "markdown", "content": "**Task Name**"}
-                    ]},
-                    {"tag": "column", "width": "weighted", "weight": 2, "elements": [
-                        {"tag": "markdown", "content": "**Email**"}
-                    ]},
-                    {"tag": "column", "width": "weighted", "weight": 1, "elements": [
-                        {"tag": "markdown", "content": "**Decision**"}
-                    ]},
-                    {"tag": "column", "width": "weighted", "weight": 1, "elements": [
-                        {"tag": "markdown", "content": "**Before Appeal**"}
-                    ]},
-                    {"tag": "column", "width": "weighted", "weight": 1, "elements": [
-                        {"tag": "markdown", "content": "**After Appeal**"}
-                    ]},
-                ]
-            },
-            *rows_elements,
         ]
     }
 
@@ -868,6 +832,11 @@ def main():
             synced_count, sync_results = sync_perf_tracker(token, appeal_items, link_lookup)
             print("\nSending summary card...")
             send_summary_card(token, appeal_items, linked_updated, synced_count, sync_results)
+
+    # Run post-processing to check for ongoing appeals
+    print("\n" + "="*80)
+    from post_processing import process_ongoing_appeals
+    process_ongoing_appeals(token)
 
 
 if __name__ == "__main__":
