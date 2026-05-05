@@ -342,7 +342,7 @@ def map_tasks_to_base(released_tasks, base_records):
                 eval_round_dispute = extract_text(rec["fields"].get("Evaluation Round Dispute", ""))
                 force_sp_qa_one = (
                     normalize_text(arbitrator_decision) == "successful appeal"
-                    and normalize_text(eval_round_dispute) == "poc round"
+                    and "poc round" in normalize_text(eval_round_dispute)
                 )
                 if poc_decision in DECISIONS_TO_UPDATE:
                     decision = poc_decision
